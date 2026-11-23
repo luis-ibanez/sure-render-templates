@@ -4,6 +4,14 @@
 # branch's own render.yaml (tests/lib/blueprint.py), so env vars, image tag,
 # disk and worker command can't drift from what users deploy.
 #
+# Which branch content boots:
+# - pull_request CI generates the deploy branches from the checked-out
+#   (proposed) source in a scratch clone and boots that, so a template-
+#   changing PR tests its own Blueprint instead of the live branches it has
+#   not published yet.
+# - main pushes and local runs boot the LIVE branches (refs/remotes/origin),
+#   so a merged template change that was never published fails here.
+#
 #   E2E_BRANCH   deploy branch to test (default: sure-no-ai)
 #   E2E_WEB_PORT host port for sure-web (default: 3000)
 #   E2E_MEM_LIMIT optional memory cap for web, worker and AlphaClaw, e.g. 512m
@@ -26,7 +34,19 @@ setup_file() {
   # blueprint.py suffixes service names the way Render can (sure-web-2clo).
   export WEB=sure-web-e2e WORKER=sure-worker-e2e ALPHACLAW=alphaclaw-e2e
   # The whole branch, so docker-runtime services (AlphaClaw) build from it.
-  git -C "${REPO_ROOT}" archive "$(remote_ref "$E2E_BRANCH")" | tar -xf - -C "${E2E_DIR}"
+  if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
+    E2E_GEN_DIR="$(mktemp -d)"; export E2E_GEN_DIR
+    git clone -q --no-checkout "${REPO_ROOT}" "$E2E_GEN_DIR/repo"
+    git -C "$E2E_GEN_DIR/repo" config user.email "e2e-gen@example.invalid"
+    git -C "$E2E_GEN_DIR/repo" config user.name "e2e-gen"
+    git -C "$E2E_GEN_DIR/repo" checkout -q -B e2e-src "$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+    (cd "$E2E_GEN_DIR/repo" && ./scripts/update-deploy-branches.sh >/dev/null)
+    export E2E_SRC_REPO="$E2E_GEN_DIR/repo" E2E_SRC_REF="$E2E_BRANCH"
+  else
+    E2E_SRC_REF="$(remote_ref "$E2E_BRANCH")"
+    export E2E_SRC_REPO="${REPO_ROOT}" E2E_SRC_REF
+  fi
+  git -C "${E2E_SRC_REPO}" archive "$E2E_SRC_REF" | tar -xf - -C "${E2E_DIR}"
   if is_external_ai; then
     # Values Render prompts for. AlphaClaw only needs the GitHub ones during
     # its first-run setup, which this test doesn't run.
@@ -61,7 +81,7 @@ teardown_file() {
     $DC logs --no-color --tail 120 >> "${E2E_LOG_FILE:-/tmp/sure-e2e-logs.txt}" 2>&1 || true
     $DC down -v --remove-orphans >/dev/null 2>&1 || true
   fi
-  rm -rf "${E2E_DIR:-/nonexistent}"
+  rm -rf "${E2E_DIR:-/nonexistent}" "${E2E_GEN_DIR:-/nonexistent}"
 }
 
 redis() { $DC exec -T redis redis-cli "$@"; }
